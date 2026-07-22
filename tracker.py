@@ -70,8 +70,10 @@ class UsageTracker:
         self._lock              = threading.Lock()
         self._stop_event        = threading.Event()
         self._session_start: float | None = None
+        self._idle_start:    float | None = None
         self._was_idle          = False
         self._today_active_sec  = 0.0
+        self._today_idle_sec    = 0.0
         self._today_date        = date.today()
 
     # ── Dynamic threshold control ──────────────────────────────────────────────
@@ -114,12 +116,14 @@ class UsageTracker:
     def _print_status(self) -> None:
         with self._lock:
             threshold = self.idle_threshold
-        total = self._fmt_hms(self._today_active_sec)
-        state = "idle" if self._was_idle else "active"
+        active = self._fmt_hms(self._today_active_sec)
+        idle   = self._fmt_hms(self._today_idle_sec)
+        state  = "idle" if self._was_idle else "active"
         print(
             f"\n  State          : {state}\n"
             f"  Idle threshold : {threshold}s\n"
-            f"  Today active   : {total}\n",
+            f"  Today active   : {active}\n"
+            f"  Today inactive : {idle}\n",
             flush=True,
         )
 
@@ -135,7 +139,8 @@ class UsageTracker:
         with open(self.log_file, "w") as f:
             json.dump(data, f, indent=2)
 
-    def _record_session(self, start: float, end: float) -> None:
+    def _record_session(self, start: float, end: float, kind: str = "active") -> None:
+        """Persist one active or idle period to the log file."""
         duration = end - start
         if duration < 1:
             return
@@ -147,28 +152,50 @@ class UsageTracker:
             "end":      datetime.fromtimestamp(end).isoformat(timespec="seconds"),
             "duration": round(duration, 1),
         }
-        log.setdefault(day_key, {"sessions": [], "total_active_sec": 0})
-        log[day_key]["sessions"].append(entry)
-        log[day_key]["total_active_sec"] = round(
-            log[day_key]["total_active_sec"] + duration, 1
-        )
+        log.setdefault(day_key, {
+            "sessions":        [], "total_active_sec":   0,
+            "idle_sessions":   [], "total_inactive_sec": 0,
+        })
+        # back-fill keys for logs written before this version
+        log[day_key].setdefault("idle_sessions",   [])
+        log[day_key].setdefault("total_inactive_sec", 0)
+
+        if kind == "active":
+            log[day_key]["sessions"].append(entry)
+            log[day_key]["total_active_sec"] = round(
+                log[day_key]["total_active_sec"] + duration, 1
+            )
+            self._today_active_sec += duration
+        else:
+            log[day_key]["idle_sessions"].append(entry)
+            log[day_key]["total_inactive_sec"] = round(
+                log[day_key]["total_inactive_sec"] + duration, 1
+            )
+            self._today_idle_sec += duration
+
         self._save_log(log)
-        self._today_active_sec += duration
 
     # ── State machine ──────────────────────────────────────────────────────────
 
     def _on_became_active(self) -> None:
-        self._session_start = time.time()
+        now = time.time()
+        if self._idle_start is not None:
+            self._record_session(self._idle_start, now, kind="inactive")
+        self._idle_start    = None
+        self._session_start = now
         self._was_idle      = False
-        print(f"[{_now()}] Active  — session started", flush=True)
+        inactive = self._fmt_hms(self._today_idle_sec)
+        print(f"[{_now()}] Active  — today's inactive time: {inactive}", flush=True)
 
     def _on_became_idle(self) -> None:
+        now = time.time()
         if self._session_start is not None:
-            self._record_session(self._session_start, time.time())
+            self._record_session(self._session_start, now, kind="active")
         self._session_start = None
+        self._idle_start    = now
         self._was_idle      = True
-        total = self._fmt_hms(self._today_active_sec)
-        print(f"[{_now()}] Idle    — today's active time: {total}", flush=True)
+        active = self._fmt_hms(self._today_active_sec)
+        print(f"[{_now()}] Idle    — today's active time: {active}", flush=True)
 
     def run(self) -> None:
         with self._lock:
@@ -185,10 +212,15 @@ class UsageTracker:
             while not self._stop_event.is_set():
                 today = date.today()
                 if today != self._today_date:
+                    now = time.time()
                     if self._session_start is not None:
-                        self._record_session(self._session_start, time.time())
-                        self._session_start = time.time()
+                        self._record_session(self._session_start, now, kind="active")
+                        self._session_start = now
+                    if self._idle_start is not None:
+                        self._record_session(self._idle_start, now, kind="inactive")
+                        self._idle_start = now
                     self._today_active_sec = 0.0
+                    self._today_idle_sec   = 0.0
                     self._today_date       = today
 
                 idle_sec = get_idle_seconds()
@@ -210,8 +242,11 @@ class UsageTracker:
 
         self._stop_event.set()
         print("\nStopping…")
+        now = time.time()
         if self._session_start is not None:
-            self._record_session(self._session_start, time.time())
+            self._record_session(self._session_start, now, kind="active")
+        if self._idle_start is not None:
+            self._record_session(self._idle_start, now, kind="inactive")
         self._print_summary()
 
     # ── Reporting ──────────────────────────────────────────────────────────────
@@ -221,14 +256,22 @@ class UsageTracker:
         print("\n─── Today's summary ───────────────────────────────")
         day_key = str(date.today())
         if day_key in log:
-            entry = log[day_key]
-            total = self._fmt_hms(entry["total_active_sec"])
-            n     = len(entry["sessions"])
-            print(f"  Active sessions : {n}")
-            print(f"  Total active    : {total}")
-            for i, s in enumerate(entry["sessions"], 1):
+            entry    = log[day_key]
+            active   = self._fmt_hms(entry.get("total_active_sec", 0))
+            inactive = self._fmt_hms(entry.get("total_inactive_sec", 0))
+            n_active = len(entry.get("sessions", []))
+            n_idle   = len(entry.get("idle_sessions", []))
+            print(f"  Active sessions   : {n_active}  ({active})")
+            print(f"  Inactive sessions : {n_idle}  ({inactive})")
+            print()
+            print("  Active periods:")
+            for i, s in enumerate(entry.get("sessions", []), 1):
                 dur = self._fmt_hms(s["duration"])
-                print(f"  [{i:2}] {s['start']}  →  {s['end']}  ({dur})")
+                print(f"    [{i:2}] {s['start']}  →  {s['end']}  ({dur})")
+            print("  Inactive periods:")
+            for i, s in enumerate(entry.get("idle_sessions", []), 1):
+                dur = self._fmt_hms(s["duration"])
+                print(f"    [{i:2}] {s['start']}  →  {s['end']}  ({dur})")
         else:
             print("  No data recorded today.")
         print("────────────────────────────────────────────────────")
@@ -269,9 +312,10 @@ def show_report() -> None:
 
     print("\n─── Usage report ───────────────────────────────────")
     for day, data in sorted(log.items()):
-        total = UsageTracker._fmt_hms(data["total_active_sec"])
-        n     = len(data["sessions"])
-        print(f"  {day}  |  sessions: {n:3}  |  active: {total}")
+        active   = UsageTracker._fmt_hms(data.get("total_active_sec", 0))
+        inactive = UsageTracker._fmt_hms(data.get("total_inactive_sec", 0))
+        n        = len(data.get("sessions", []))
+        print(f"  {day}  |  sessions: {n:3}  |  active: {active}  |  inactive: {inactive}")
     print("────────────────────────────────────────────────────\n")
 
 
